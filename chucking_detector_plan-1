@@ -1,0 +1,287 @@
+# Cricket "Chucking" Detector — Implementation Plan
+
+## Goal
+Build a single-file Python prototype (`prototype.py`) that analyzes bowling action video to detect illegal "chucking" per the ICC 15° elbow extension rule, using **MediaPipe Pose Landmarker** for 3D joint tracking on CPU.
+
+> [!IMPORTANT]
+> This plan follows a **tutoring workflow**: each step produces a small, runnable increment of `prototype.py`. You run it, confirm the output, and then we layer on the next step. No large code dumps.
+
+---
+
+## Background Context
+
+### The ICC 15° Rule
+An illegal bowling action is one where the bowler's **elbow extends by more than 15°** between:
+- **Start**: The arm reaching the horizontal plane (shoulder height).
+- **End**: The point of ball release.
+
+This tolerance exists because biomechanical studies show all bowlers exhibit *some* natural elbow straightening. The 15° threshold separates natural movement from an unfair advantage.
+
+### Why MediaPipe Pose?
+- **Pre-trained** — no training data or GPUs needed.
+- **33 landmarks** with both 2D (normalized) and **3D world coordinates** (in meters, origin at hip center).
+- **CPU-optimized** — runs comfortably on your ThinkPad T480.
+- Provides `pose_world_landmarks` which give metric-space 3D coordinates ideal for angle calculation.
+
+### MediaPipe Landmark Indices We Need
+
+| Joint | Left (bowler's perspective) | Right |
+|:------|:--:|:--:|
+| **Shoulder** | 11 | 12 |
+| **Elbow** | 13 | 14 |
+| **Wrist** | 15 | 16 |
+
+> [!NOTE]
+> "Left" and "Right" are from the **person's own perspective**, not the camera's. For a right-arm bowler, we need indices **12, 14, 16**. For a left-arm bowler, **11, 13, 15**.
+
+---
+
+## User Review Required
+
+> [!IMPORTANT]
+> **Bowling Arm Side**: The script needs to know whether to track the left or right arm. In Step 1, we'll default to **right-arm bowler** and add a command-line flag later. Please confirm this default is correct for your test video.
+
+> [!IMPORTANT]
+> **Test Video**: You'll need a short video clip of a bowling action (side-on or broadcast angle). Please have one ready before Step 1. A 5–15 second clip at 30 fps is ideal.
+
+---
+
+## Open Questions
+
+> [!WARNING]
+> **API Choice — Legacy vs. Tasks API**: The old `mp.solutions.pose` was deprecated in March 2023. This plan uses the **modern MediaPipe Tasks API** (`PoseLandmarker` with `RunningMode.VIDEO`), which requires downloading a `.task` model file (~26 MB). Are you comfortable with this, or do you have a strong preference for the legacy API?
+
+> [!NOTE]
+> **Kaggle Compatibility**: The Tasks API works in Kaggle notebooks. The model file can be downloaded via `wget` in a cell. No issues expected.
+
+---
+
+## Proposed Changes — Step-by-Step Roadmap
+
+Each step is a **single incremental edit** to `prototype.py`. We proceed only after you confirm the previous step works.
+
+---
+
+### Step 1 — Skeleton Extraction (Landmark Printing)
+**Goal**: Load a video, run MediaPipe Pose frame-by-frame, print raw 3D coordinates of Shoulder/Elbow/Wrist.
+
+#### [NEW] `prototype.py`
+Minimal script (~50 lines):
+
+```python
+"""
+Cricket Chucking Detector — Step 1: Skeleton Extraction
+Loads a video, runs MediaPipe Pose Landmarker, prints 3D bowling-arm
+coordinates (Shoulder, Elbow, Wrist) for every frame.
+"""
+import cv2
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+
+# --- Configuration ---
+VIDEO_PATH = "bowling_clip.mp4"          # ← Replace with your video filename
+MODEL_PATH = "pose_landmarker_full.task"  # Downloaded model file
+ARM_SIDE = "right"                        # "right" or "left"
+
+# Landmark indices
+if ARM_SIDE == "right":
+    SHOULDER_IDX, ELBOW_IDX, WRIST_IDX = 12, 14, 16
+else:
+    SHOULDER_IDX, ELBOW_IDX, WRIST_IDX = 11, 13, 15
+
+# --- Set up PoseLandmarker ---
+base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
+options = vision.PoseLandmarkerOptions(
+    base_options=base_options,
+    running_mode=vision.RunningMode.VIDEO,
+)
+
+cap = cv2.VideoCapture(VIDEO_PATH)
+fps = cap.get(cv2.CAP_PROP_FPS)
+print(f"Video: {VIDEO_PATH} | FPS: {fps:.1f}")
+
+with vision.PoseLandmarker.create_from_options(options) as landmarker:
+    frame_idx = 0
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # Convert BGR → RGB and wrap for MediaPipe
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        timestamp_ms = int(frame_idx * 1000 / fps)
+
+        result = landmarker.detect_for_video(mp_image, timestamp_ms)
+
+        if result.pose_world_landmarks:
+            wl = result.pose_world_landmarks[0]  # First detected person
+            s = wl[SHOULDER_IDX]
+            e = wl[ELBOW_IDX]
+            w = wl[WRIST_IDX]
+            print(
+                f"Frame {frame_idx:4d} | "
+                f"Shoulder({s.x:+.4f}, {s.y:+.4f}, {s.z:+.4f}) | "
+                f"Elbow({e.x:+.4f}, {e.y:+.4f}, {e.z:+.4f}) | "
+                f"Wrist({w.x:+.4f}, {w.y:+.4f}, {w.z:+.4f})"
+            )
+        else:
+            print(f"Frame {frame_idx:4d} | No pose detected")
+
+        frame_idx += 1
+
+cap.release()
+print(f"\nDone. Processed {frame_idx} frames.")
+```
+
+**What you'll learn**: How MediaPipe's world landmarks give you real metric 3D coordinates anchored at the hip. These are the raw inputs for all angle calculations.
+
+**Setup required before running**:
+```bash
+pip install mediapipe opencv-python
+```
+```bash
+# Download the model file (~26 MB)
+curl -o pose_landmarker_full.task https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task
+```
+
+**Expected output**: One line per frame showing 3D (x, y, z) in meters for each joint, or "No pose detected" for frames where the bowler isn't visible.
+
+---
+
+### Step 2 — 3D Elbow Angle Calculation
+**Goal**: Add a `calc_elbow_angle_3d()` function using vector dot products. Print the angle alongside the coordinates.
+
+**Key concept** (the math you'll implement):
+```
+Vector A = Shoulder - Elbow   (upper arm)
+Vector B = Wrist   - Elbow   (forearm)
+
+cos(θ) = (A · B) / (|A| × |B|)
+θ = arccos(cos(θ))          → in degrees
+```
+
+A fully extended arm = ~180°. A bent arm = ~90°.
+
+**Changes**: Add ~15 lines to `prototype.py` — one function + one print call.
+
+---
+
+### Step 3 — Collect Angle Time-Series & Plot
+**Goal**: Store `(frame_idx, timestamp_sec, elbow_angle)` in a list. After processing, plot the angle curve with `matplotlib`.
+
+**Why this matters**: The plot visually reveals the bowling action window — you'll see the angle dip (arm cocking) then rise (extension). This is the data we'll analyze programmatically in Step 4.
+
+**Changes**: ~20 lines — a list append in the loop + a plotting section after the loop.
+
+---
+
+### Step 4 — Detect the ICC Evaluation Window
+**Goal**: Automatically detect the **start** and **end** of the evaluation window.
+
+| Event | Detection Heuristic |
+|:------|:-------------------|
+| **Start** (arm horizontal) | Shoulder Y ≈ Wrist Y (within a tolerance), indicating the arm is roughly at shoulder height. |
+| **End** (ball release) | Wrist reaches its **highest point** (minimum Y in MediaPipe's coordinate system where Y increases downward) after the start event. |
+
+**Changes**: ~30 lines — scanning the time-series for these conditions + marking the window on the plot.
+
+> [!TIP]
+> We use the **world landmark Y-coordinate** (vertical axis) for the horizontal-plane check. In MediaPipe's world coordinate system, Y increases downward, so "arm at shoulder height" means `shoulder.y ≈ wrist.y`.
+
+---
+
+### Step 5 — Extension Calculation & Classification
+**Goal**: Within the detected window, compute:
+- `θ_min` — minimum elbow angle (maximum bend)
+- `θ_release` — elbow angle at ball release frame
+- `Δθ = θ_release - θ_min` — the **elbow extension**
+
+Then classify:
+```
+if Δθ <= 15.0:  → ✅ LEGAL
+if Δθ >  15.0:  → ❌ ILLEGAL (Chucking)
+```
+
+**Changes**: ~20 lines — min/max search within the window + a final verdict print.
+
+---
+
+### Step 6 — Visual Overlay & Summary Report
+**Goal**: Produce an annotated output video showing:
+- Skeleton overlay on the bowling arm (Shoulder → Elbow → Wrist lines).
+- Live angle readout on each frame.
+- Color-coded: green = legal window, red = illegal extension detected.
+- A text summary printed to console with all key metrics.
+
+**Changes**: ~40 lines — `cv2.line()`, `cv2.putText()`, `cv2.VideoWriter()`.
+
+---
+
+## Architecture Overview
+
+```mermaid
+flowchart TD
+    A["📹 Input Video"] --> B["OpenCV<br/>Frame Extraction"]
+    B --> C["MediaPipe Pose Landmarker<br/>(CPU, VIDEO mode)"]
+    C --> D["3D World Landmarks<br/>(Shoulder, Elbow, Wrist)"]
+    D --> E["3D Angle Calculation<br/>(Vector Dot Product)"]
+    E --> F["Angle Time-Series<br/>(per-frame θ)"]
+    F --> G["ICC Window Detection<br/>(arm horizontal → ball release)"]
+    G --> H["Extension Δθ Calculation<br/>(θ_release − θ_min)"]
+    H --> I{"Δθ > 15°?"}
+    I -->|"≤ 15°"| J["✅ Legal Delivery"]
+    I -->|"> 15°"| K["❌ Illegal (Chucking)"]
+    
+    style A fill:#1a1a2e,stroke:#e94560,color:#eee
+    style C fill:#16213e,stroke:#0f3460,color:#eee
+    style I fill:#533483,stroke:#e94560,color:#eee
+    style J fill:#0a3d62,stroke:#38ada9,color:#eee
+    style K fill:#6a0136,stroke:#e94560,color:#eee
+```
+
+---
+
+## Dependency Stack
+
+| Package | Purpose | Install |
+|:--------|:--------|:--------|
+| `mediapipe` | Pose estimation (Tasks API) | `pip install mediapipe` |
+| `opencv-python` | Video I/O, frame manipulation | `pip install opencv-python` |
+| `numpy` | Vector math (dot product, arccos) | Bundled with mediapipe |
+| `matplotlib` | Angle time-series plotting (Step 3+) | `pip install matplotlib` |
+
+Total install size: ~150 MB. All CPU-only. No GPU drivers needed.
+
+---
+
+## Verification Plan
+
+### After Each Step (Manual)
+| Step | What to Verify |
+|:-----|:---------------|
+| 1 | Coordinates print for every frame. No crashes. Values are in meters (small floats like ±0.3). |
+| 2 | Angle values are in range ~80°–180°. Fully extended arm ≈ 170–180°. |
+| 3 | Plot shows a clear curve with a visible dip-then-rise during the bowling action. |
+| 4 | Start/End frames are visually reasonable (check against the video). |
+| 5 | Δθ value is plausible. Known legal bowlers < 15°, known chuckers > 15°. |
+| 6 | Output video plays correctly with overlaid skeleton and angle text. |
+
+### Edge Cases to Test
+- **No pose detected** frames (bowler partially off-screen).
+- **Multiple people** in frame (we take `pose_world_landmarks[0]` — first detection).
+- **Very short clips** (< 1 second) — may not have a full bowling action.
+
+---
+
+## What We're Building First (Step 1)
+
+When you approve this plan, I will write **only Step 1** of `prototype.py` — the minimal skeleton extraction script. You'll:
+
+1. Install `mediapipe` and `opencv-python`.
+2. Download the model file.
+3. Place your test video in the project folder.
+4. Run the script and confirm you see 3D coordinates printed.
+
+Then we move to Step 2 together.
